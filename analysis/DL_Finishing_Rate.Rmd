@@ -1,0 +1,359 @@
+---
+title: "Pressure to Sack Rate: Quantifying DL Finishing Ability"
+author: "Matthew Griffith"
+date: "2026-05-30"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r load-packages}
+library(tidyverse)
+library(ggplot2)
+library(knitr)
+library(gt)
+library(glue)
+library(nflreadr)
+library(gtExtras)
+library(ggrepel)
+```
+
+```{r load-data, cache=TRUE}
+plays       <- read_csv("data/plays.csv")
+player_play <- read_csv("data/player_play.csv")
+players     <- read_csv("data/players.csv")
+games       <- read_csv("data/games.csv")
+```
+
+```{r filter-valid-plays}
+# Exclude penalty-nullified plays, QB kneels, and QB spikes
+valid_plays <- plays %>%
+  filter(
+    playNullifiedByPenalty != "Y",
+    qbKneel == 0,
+    qbSpike != TRUE | is.na(qbSpike)
+  )
+```
+
+```{r player-attributes}
+player_attributes <- players %>%
+  select(nflId, displayName, position, height, weight)
+```
+
+```{r build-pass-rush-events}
+# Join player_play to valid dropbacks only, keeping only designated pass rushers
+# Attach player attributes (name, position, height, weight) via left join
+# Create binary flags for won reps and finish types
+pass_rush_events <- player_play %>%
+  inner_join(
+    valid_plays %>% filter(isDropback == TRUE),
+    by = c("gameId", "playId")
+  ) %>%
+  filter(wasInitialPassRusher == 1) %>%
+  left_join(player_attributes, by = "nflId") %>%
+  mutate(
+    won_rep         = causedPressure == TRUE,
+    solo_finish     = sackYardsAsDefense < 0     & !is.na(sackYardsAsDefense),
+    assisted_finish = halfSackYardsAsDefense < 0 & !is.na(halfSackYardsAsDefense),
+    any_finish      = solo_finish | assisted_finish
+  )
+```
+
+```{r aggregate-player-summary}
+# Aggregate pass rush events to the player level
+player_summary <- pass_rush_events %>%
+  group_by(nflId, displayName, position, height, weight, teamAbbr) %>%
+  summarise(
+    total_pass_rushes       = n(),
+    total_pressures         = sum(won_rep, na.rm = TRUE),
+    solo_sacks              = sum(solo_finish, na.rm = TRUE),
+    assisted_sacks          = sum(assisted_finish, na.rm = TRUE),
+    total_sacks             = solo_sacks + (assisted_sacks * 0.5),
+    pressure_rate           = total_pressures / total_pass_rushes,
+    ptsr_solo               = ifelse(total_pressures == 0, 0,
+                                     solo_sacks / total_pressures),
+    ptsr_full               = ifelse(total_pressures == 0, 0,
+                                     total_sacks / total_pressures),
+    ptsr_gap                = ptsr_full - ptsr_solo,
+    mean_time_to_pressure = mean(timeToPressureAsPassRusher, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+```{r threshold-visualization}
+# Visualize the tradeoff between minimum pressure threshold and qualified player count
+# Iterates every integer threshold from 1 to 50 and counts qualifying players at each
+tibble(min_pressures = 1:50) %>%
+  mutate(
+    n_players = map_int(min_pressures,
+                        ~sum(player_summary$total_pressures >= .x))
+  ) %>%
+  ggplot(aes(x = min_pressures, y = n_players)) +
+  geom_line(color = "#241773", linewidth = 1) +
+  geom_point(color = "#241773", size = 1.5) +
+  geom_vline(xintercept = 20, color = "#9E7C0C", linetype = "dashed", linewidth = 0.8) +
+  annotate("text", x = 21.5, y = 300,
+           label = "Selected threshold (20)", hjust = 0,
+           color = "#9E7C0C", size = 3.5) +
+  scale_x_continuous(breaks = seq(0, 50, by = 5)) +
+  scale_y_continuous(breaks = seq(0, 350, by = 50)) +
+  labs(
+    title    = "Qualified Players by Minimum Pressure Threshold",
+    subtitle = "Dashed line marks selected cutoff of 20 pressures",
+    x        = "Minimum Pressures Required",
+    y        = "Number of Qualified Players"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title       = element_text(face = "bold", color = "#000000"),
+    plot.subtitle    = element_text(color = "#555555"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+```{r filter-qualified-players}
+# Load 2022 roster headshot URLs from nflverse
+rosters <- load_rosters(seasons = 2022) %>%
+  select(full_name, headshot_url) %>%
+  filter(full_name != "Josh Allen" | 
+         headshot_url == "https://static.www.nfl.com/image/private/f_auto,q_auto/league/c1lvavhrved77o44fnol") %>%
+  distinct(full_name, .keep_all = TRUE)
+
+# Filter to qualified players (minimum 20 pressures) and join headshot URLs
+# Fixed Josh Allen headshot confusion
+qualified_summary <- player_summary %>%
+  filter(total_pressures >= 20) %>%
+  mutate(join_name = recode(displayName, 
+                            "Josh Hines-Allen" = "Josh Allen")) %>%
+  left_join(rosters, by = c("join_name" = "full_name")) %>%
+  mutate(
+    headshot_url = ifelse(
+      displayName == "Josh Hines-Allen",
+      "https://static.www.nfl.com/image/private/f_auto,q_auto/league/c1lvavhrved77o44fnol",
+      headshot_url
+    )
+  ) %>%
+  select(-join_name)
+```
+
+
+```{r gt-summary-table}
+# Build the primary results table using gt
+# Top 10 sorted by PTSR Full descending - best finishers at the top
+qualified_summary %>%
+  arrange(desc(ptsr_full)) %>%
+  slice_head(n = 10) %>% 
+  select(
+    headshot_url, displayName, position, teamAbbr, total_pass_rushes, total_pressures,
+    pressure_rate, solo_sacks, assisted_sacks, total_sacks,
+    ptsr_solo, ptsr_full, ptsr_gap, mean_time_to_pressure
+  ) %>%
+  gt() %>%
+  gt_img_rows(
+    columns = headshot_url,
+    height  = 55
+  ) %>%
+  cols_width(
+    headshot_url ~ px(60)
+  ) %>%
+  tab_header(
+    title    = md("**Pressure to Sack Rate — Pass Rush Finishing Leaderboard**"),
+    subtitle = md("Weeks 1–9, 2022 NFL Season | Minimum 20 pressures")
+  ) %>%
+  cols_label(
+    headshot_url            = "",
+    displayName             = "Player",
+    position                = "Pos.",
+    teamAbbr                = "Team",
+    total_pass_rushes       = "Pass Rushes",
+    total_pressures         = "Pressures",
+    pressure_rate           = "Pressure Rate",
+    solo_sacks              = "Solo Sacks",
+    assisted_sacks          = "Half Sacks",
+    total_sacks             = "Total Sacks",
+    ptsr_solo               = "PTSR (Solo)",
+    ptsr_full               = "PTSR (Full)",
+    ptsr_gap                = "Independence Gap",
+    mean_time_to_pressure = "Average Time to Pressure (s)"
+  ) %>%
+  fmt_percent(
+    columns  = c(pressure_rate, ptsr_solo, ptsr_full, ptsr_gap),
+    decimals = 1
+  ) %>%
+  fmt_number(
+    columns  = c(solo_sacks, assisted_sacks),
+    decimals = 0
+  ) %>%
+  fmt_number(
+    columns  = total_sacks,
+    decimals = 1
+  ) %>%
+  fmt_number(
+    columns  = mean_time_to_pressure,
+    decimals = 2
+  ) %>%
+  data_color(
+    columns = ptsr_full,
+    palette = c("#ffffff", "#241773")
+  ) %>%
+  tab_style(
+    style     = cell_text(color = "#ffffff", weight = "bold"),
+    locations = list(
+      cells_title(groups = "title"),
+      cells_title(groups = "subtitle")
+    )
+  ) %>%
+  tab_style(
+    style     = cell_text(color = "#ffffff", weight = "bold"),
+    locations = cells_column_labels()
+  ) %>%
+  opt_row_striping() %>%
+    tab_options(
+    heading.background.color       = "#241773",
+    column_labels.background.color = "#000000",
+    table.font.size                = px(13),
+    data_row.padding               = px(12),
+    row.striping.background_color  = "#f5f5f5"
+  )
+```
+
+
+```{r chart-1, fig.width=10, fig.height=7}
+# Chart 1 — Pressure Rate vs. PTSR Full (Quadrant scatter)
+# Plots how often a player generates pressure (x) against how often he finishes sacks (y)
+# Dashed reference lines at median pressure rate and median PTSR divide the plot
+# into four quadrants identifying distinct pass rusher archetypes:
+#   Elite Finishers — high pressure rate, high PTSR
+#   Opportunistic Finishers — low pressure rate, high PTSR
+#   Motor Players — high pressure rate, low PTSR
+#   Developing Players — low pressure rate, low PTSR
+# Points colored by position, labeled by player name
+med_pressure_rate <- median(qualified_summary$pressure_rate)
+med_ptsr_full     <- median(qualified_summary$ptsr_full)
+
+ggplot(qualified_summary, aes(x = pressure_rate, y = ptsr_full,
+                               color = position, label = displayName)) +
+  geom_vline(xintercept = med_pressure_rate, linetype = "dashed",
+             color = "gray50", linewidth = 0.6) +
+  geom_hline(yintercept = med_ptsr_full, linetype = "dashed",
+             color = "gray50", linewidth = 0.6) +
+  geom_point(size = 3, alpha = 0.8) +
+  ggrepel::geom_text_repel(size = 3, max.overlaps = 20) +
+  annotate("text", x = max(qualified_summary$pressure_rate),
+           y = max(qualified_summary$ptsr_full),
+           label = "Elite Finishers", hjust = 1, vjust = 1,
+           color = "gray40", fontface = "italic", size = 3.5) +
+  annotate("text", x = min(qualified_summary$pressure_rate),
+           y = max(qualified_summary$ptsr_full),
+           label = "Opportunistic Finishers", hjust = 0, vjust = 1,
+           color = "gray40", fontface = "italic", size = 3.5) +
+  annotate("text", x = max(qualified_summary$pressure_rate),
+           y = min(qualified_summary$ptsr_full),
+           label = "Motor Players", hjust = 1, vjust = 0,
+           color = "gray40", fontface = "italic", size = 3.5) +
+  annotate("text", x = min(qualified_summary$pressure_rate),
+           y = min(qualified_summary$ptsr_full),
+           label = "Developing Players", hjust = 0, vjust = 0,
+           color = "gray40", fontface = "italic", size = 3.5) +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title    = "Pressure Rate vs. Pressure-to-Sack Rate",
+    subtitle = "Dashed lines mark median pressure rate and median PTSR | Minimum 20 pressures | Weeks 1–9, 2022",
+    x        = "Pressure Rate (Pressures / Pass Rushes)",
+    y        = "PTSR — Full (Sacks / Pressures)",
+    color    = "Position"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title       = element_text(face = "bold", color = "#000000"),
+    plot.subtitle    = element_text(color = "#555555"),
+    panel.grid.minor = element_blank(),
+    legend.position  = "bottom"
+  )
+```
+
+```{r chart-2, fig.width=10, fig.height=7}
+# Chart 2 — Solo PTSR vs. Full PTSR (Finishing Independence scatter)
+# Compares each player's solo finishing rate against their overall finishing rate
+# Players on the diagonal finish entirely independently (no half sacks)
+# Players above the diagonal have half sacks inflating their full rate
+# Only labels the top 5 by independence gap and top 2 by PTSR Full
+# to reduce overplotting while highlighting the most relevant players
+top_gap  <- qualified_summary %>% slice_max(ptsr_gap,   n = 5) %>% pull(nflId)
+top_ptsr <- qualified_summary %>% slice_max(ptsr_full,  n = 2)  %>% pull(nflId)
+
+qualified_summary <- qualified_summary %>%
+  mutate(label_player = ifelse(nflId %in% c(top_gap, top_ptsr), displayName, NA))
+
+ggplot(qualified_summary, aes(x = ptsr_solo, y = ptsr_full,
+                               color = position, label = label_player)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+              color = "gray50", linewidth = 0.6) +
+  geom_point(size = 3, alpha = 0.8) +
+  ggrepel::geom_text_repel(size = 3, max.overlaps = 20, na.rm = TRUE) +
+  annotate("text", x = 0.25, y = 0.19,
+           label = "Finishes independently", hjust = 0,
+           color = "gray40", fontface = "italic", size = 3.5) +
+  annotate("text", x = 0.05, y = 0.20,
+           label = "Half sacks inflate full rate", hjust = 0,
+           color = "gray40", fontface = "italic", size = 3.5) +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title    = "Solo PTSR vs. Full PTSR — Finishing Independence",
+    subtitle = "Weeks 1–9, 2022",
+    x        = "PTSR Solo (Solo Sacks / Pressures)",
+    y        = "PTSR Full (Total Sacks / Pressures)",
+    color    = "Position"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title       = element_text(face = "bold", color = "#000000"),
+    plot.subtitle    = element_text(color = "#555555"),
+    panel.grid.minor = element_blank(),
+    legend.position  = "bottom"
+  )
+```
+
+```{r chart-3, fig.width=10, fig.height=7}
+# Chart 3 — Time to Pressure vs. PTSR Full (Regression chart)
+# Tests whether pass rushers who get to the QB faster convert at higher rates
+# Pearson correlation computed before plotting and annotated directly on the chart
+# Linear regression line fitted via geom_smooth(method = "lm") with confidence interval
+
+cor_val <- cor(qualified_summary$mean_time_to_pressure,
+               qualified_summary$ptsr_full,
+               use = "complete.obs")
+
+ggplot(qualified_summary, aes(x = mean_time_to_pressure, y = ptsr_full,
+                               color = position, label = displayName)) +
+  geom_smooth(method = "lm", se = TRUE, color = "#9E7C0C",
+              fill = "#9E7C0C", alpha = 0.15, linewidth = 1) +
+  geom_point(size = 3, alpha = 0.8) +
+  ggrepel::geom_text_repel(size = 3, max.overlaps = 15, na.rm = TRUE) +
+  annotate("text",
+           x = max(qualified_summary$mean_time_to_pressure, na.rm = TRUE),
+           y = max(qualified_summary$ptsr_full, na.rm = TRUE),
+           label = glue::glue("r = {round(cor_val, 2)}"),
+           hjust = 1, vjust = 1, size = 4.5,
+           color = "#241773", fontface = "bold") +
+  scale_x_continuous() +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title    = "Time to Pressure vs. Pressure-to-Sack Rate",
+    subtitle = "Does getting to the QB faster translate to more sacks? | Weeks 1–9, 2022",
+    x        = "Average Time to Pressure (seconds)",
+    y        = "PTSR Full (Sacks / Pressures)",
+    color    = "Position"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title       = element_text(face = "bold", color = "#000000"),
+    plot.subtitle    = element_text(color = "#555555"),
+    panel.grid.minor = element_blank(),
+    legend.position  = "bottom"
+  )
+```
