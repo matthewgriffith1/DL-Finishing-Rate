@@ -18,7 +18,25 @@ generate pressure.
 
 - R (>= 4.1)
 - RStudio (recommended)
-- Access to the NFL Big Data Bowl 2023 data via Kaggle or Onedrive
+- Access to the NFL Big Data Bowl 2023 data via Kaggle or OneDrive
+
+## Data
+
+The raw data files are not included in this repository. Download the NFL Big Data
+Bowl 2023 dataset from Kaggle/OneDrive and place the following files in a `data/` folder
+in the root directory before knitting:
+
+Required files:
+
+| File | Description |
+|---|---|
+| `plays.csv` | Play-level context and filters |
+| `player_play.csv` | Primary analysis file |
+| `players.csv` | Player attributes |
+| `games.csv` | Game metadata |
+
+The tracking files (`tracking_week_1.csv` through `tracking_week_9.csv`) are not
+used in this analysis and do not need to be downloaded.
 
 ## Setup
 
@@ -30,7 +48,7 @@ cd dl-finishing-rate
 
 2. Download the NFL Big Data Bowl 2023 dataset from Kaggle/Onedrive
 
-Place all CSV files in the `data/` folder. See `data/README.md` for details.
+Place all CSV files in the `data/` folder.
 
 3. Restore the R package environment
 ```r
@@ -49,8 +67,6 @@ be opened directly in any browser without running R.
 ```
 dl-finishing-rate/
 |
-|-- data/
-|   |-- README.md
 |
 |-- analysis/
 |   |-- dl_finishing_rate.Rmd
